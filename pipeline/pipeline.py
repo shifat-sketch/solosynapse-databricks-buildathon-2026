@@ -6,7 +6,7 @@ import glob
 import json
 import os
 import re
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 
 import duckdb
 
@@ -509,52 +509,71 @@ def main():
         }
     )
 
+    
     # --------------------------------------------------
     # 11. Attribute sessions to campaigns
+    # Optimized sliding-window attribution
     # --------------------------------------------------
+
+    active_clicks = deque()
+    active_campaign_counts = defaultdict(int)
+
+    active_click_user = None
+    user_clicks = ()
+    click_index = 0
 
     for session in sessions:
 
+        uid = session["user"]
+        start = session["start"]
+
+        # Sessions are already sorted by user and start time.
+        if uid != active_click_user:
+            active_clicks.clear()
+            active_campaign_counts.clear()
+
+            user_clicks = clicks_by_user.get(uid, ())
+            click_index = 0
+            active_click_user = uid
+
+        # Add clicks up to the session start.
+        while (
+            click_index < len(user_clicks)
+            and user_clicks[click_index][0] <= start
+        ):
+            click = user_clicks[click_index]
+            active_clicks.append(click)
+            active_campaign_counts[click[1]] += 1
+            click_index += 1
+
+        # Remove clicks older than the seven-day window.
+        cutoff = start - 7 * 86_400_000
+
+        while active_clicks and active_clicks[0][0] < cutoff:
+            expired = active_clicks.popleft()
+            cid = expired[1]
+
+            active_campaign_counts[cid] -= 1
+
+            if active_campaign_counts[cid] == 0:
+                del active_campaign_counts[cid]
+
+        # User daily aggregation.
         day = (
             EPOCH
-            + dt.timedelta(milliseconds=session["start"])
+            + dt.timedelta(milliseconds=start)
         ).date()
 
-        user_key = (session["user"], day)
-
+        user_key = (uid, day)
         ua = user_agg[user_key]
 
         ua["sessions"] += 1
         ua["events"] += len(session["events"])
         ua["revenue"] += session["revenue"]
-
-        ua["categories"].update(
-            session["categories"]
-        )
-
-        eligible = []
-
-        for click in clicks_by_user.get(
-            session["user"], ()
-        ):
-
-            click_ts = click[0]
-
-            if (
-                click_ts <= session["start"]
-                and session["start"] - click_ts
-                <= 7 * 86_400_000
-            ):
-                eligible.append(click)
+        ua["categories"].update(session["categories"])
 
         # One assist per campaign per session.
-        assisted_campaigns = {
-            click[1]
-            for click in eligible
-        }
-
-        for cid in assisted_campaigns:
-
+        for cid in active_campaign_counts:
             channel = campaigns[cid]
 
             campaign_agg[
@@ -562,21 +581,19 @@ def main():
             ]["assisted"] += 1
 
         # Latest eligible click receives session credit.
-        if eligible:
+        if active_clicks:
 
-            latest_ts = max(
-                click[0]
-                for click in eligible
-            )
+            latest_ts = active_clicks[-1][0]
+            chosen = active_clicks[-1]
 
-            chosen = min(
-                (
-                    click
-                    for click in eligible
-                    if click[0] == latest_ts
-                ),
-                key=lambda click: bytekey(click[2])
-            )
+            # Clicks are sorted by timestamp and bytewise click_id.
+            # Find the bytewise smallest ID at the latest timestamp.
+            for click in reversed(active_clicks):
+
+                if click[0] != latest_ts:
+                    break
+
+                chosen = click
 
             campaign_id = chosen[1]
             channel = campaigns[campaign_id]
@@ -592,7 +609,6 @@ def main():
         ca["sessions"] += 1
 
         if session["purchase"]:
-
             ca["purchasing"] += 1
             ca["revenue"] += session["revenue"]
 
